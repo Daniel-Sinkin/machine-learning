@@ -1,0 +1,29 @@
+{
+    "files.exclude": {
+        "**/build": true,
+        "**/external": true,
+        "**/_deps": true
+    },
+    "search.exclude": {
+        "**/build": true,
+        "**/external": true,
+        "**/_deps": true
+    },
+    "editor.formatOnSave": true,
+    "editor.codeActionsOnSave": {
+        "source.organizeImports": "never",
+        "source.fixAll": "explicit"
+    },
+    "C_Cpp.default.includePath": [
+        "${workspaceFolder}/src",
+        "${workspaceFolder}/src/machine_learning"
+    ],
+    "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools",
+    "C_Cpp.default.systemIncludePath": [],
+    "editor.formatOnSaveMode": "modifications",
+    "cmake.generator": "Ninja",
+    "cmake.configureOnOpen": true,
+    "files.associations": {
+        "print": "cpp"
+    }
+}
