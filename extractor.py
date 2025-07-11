@@ -1,7 +1,5 @@
-from __future__ import annotations
-
 """extractor.py
-Annotate LaTeX regions in lecture slides *and* run a simulated OCR worker.
+Annotate LaTeX regions in lecture slides and run a simulated OCR worker.
 
 CLI
 ---
@@ -16,27 +14,68 @@ Optional arguments
 -o, --out         Output directory where image crops and OCR .tex files are stored
                   (default: ./latex_regions)
 
-Key bindings inside the **Slide Viewer** window
-------------------------------------------------
+Key bindings inside the Slide Viewer window
+------------------------------------------
 click-drag : draw a box
 u          : undo last box
 q          : save boxes & next slide
 b          : save boxes & back one slide
+c          : clear all boxes on current slide
 Esc        : quit program
 """
+
+# pylint: disable=no-member
+# pylint: disable=no-name-in-module
+
+from __future__ import annotations
 
 import argparse
 import itertools
 import time
+from collections.abc import Buffer
+from dataclasses import dataclass
 from multiprocessing import Event, Process
+from multiprocessing.synchronize import Event as EventT
 from pathlib import Path
+from typing import Any, Final, Iterator, cast
 
 import cv2
-import fitz  # PyMuPDF
+import fitz
 import numpy as np
+from numpy.typing import NDArray
 
 
-_LATEX_SNIPPETS: list[str] = [
+@dataclass(frozen=True)
+class ViewerConfig:
+    """All the window-related constants."""
+
+    window_name: str = "Slide Viewer"
+    window_position: tuple[int, int] = (100, 100)
+    title_format: str = "{name} - ({current} / {total})"
+    rect_color: tuple[int, int, int] = (0, 255, 0)
+    rect_thickness: int = 2
+
+
+@dataclass(frozen=True)
+class KeyBindings:
+    """Key bindings used in the viewer."""
+
+    next_slide: int = ord("q")
+    prev_slide: int = ord("b")
+    undo_box: int = ord("u")
+    clear_boxes: int = ord("c")
+    quit: int = 27  # ESC
+
+
+class PixMap:  # pylint: disable=too-few-public-methods
+    """Wrapper for fritz.pixmap"""
+
+    def tobytes(self, x: str) -> Buffer:  # noqa: D401
+        """Converts the pixmap to a buffer of the provided type."""
+        raise NotImplementedError
+
+
+_LATEX_SNIPPETS: Final[list[str]] = [
     r"\hat{y}=\sigma(Wx+b)",
     r"L=\frac{1}{N}\sum_{i=1}^{N}(y_i-\hat{y}_i)^2",
     r"p(z\mid x)=\frac{p(x\mid z)p(z)}{p(x)}",
@@ -48,11 +87,12 @@ _LATEX_SNIPPETS: list[str] = [
     r"\text{softmax}(z)_k = \frac{e^{z_k}}{\sum_j e^{z_j}}",
     r"f(x)=\mathrm{sign}(w^Tx+b)",
 ]
-_LATEX_CYCLE = itertools.cycle(_LATEX_SNIPPETS)
+
+_LATEX_CYCLE: Final[Iterator[str]] = itertools.cycle(_LATEX_SNIPPETS)
 
 
-def ocr_worker(folder: Path, stop_event: Event) -> None:
-    """Simulate a heavy OCR service that watches *folder* for new PNG crops."""
+def ocr_worker(folder: Path, stop_event: EventT) -> None:  # noqa: D401
+    """Simulates an OCR service by watching *folder* for new PNG files and writing LaTeX output."""
     print("[OCR] Worker started")
     while True:
         if stop_event.is_set():
@@ -70,104 +110,134 @@ def ocr_worker(folder: Path, stop_event: Event) -> None:
             work_found = True
             latex_eq = next(_LATEX_CYCLE)
             print(f"[OCR] Processing {png_path.name} -> '{latex_eq}'")
-            for _ in range(30):  # simulate inference
+            for _ in range(30):
                 if stop_event.is_set():
                     break
                 time.sleep(0.1)
             if stop_event.is_set():
                 break
-            tex_path.write_text(latex_eq + "\n")
+            tex_path.write_text(f"{latex_eq}\n")
             print(f"[OCR]   -> wrote {tex_path.name}")
         if not work_found:
             time.sleep(1)
     print("[OCR] Worker shutting down")
 
 
-
-
 class BoxDrawer:
-    """Handles user interaction on a *single* slide image."""
+    """Handles bounding-box annotation for a single slide image."""
 
-    def __init__(self, image: np.ndarray, slide_num: int, total: int) -> None:
-        self.window_name = "Slide Viewer"
-        self.original = image
+    def __init__(
+        self, image: NDArray[np.uint8], slide_num: int, total_slides: int
+    ) -> None:
+        """Initializes the drawer with an image and slide metadata."""
+        self.window_name: Final[str] = ViewerConfig.window_name
+        self.original: NDArray[np.uint8] = image
         self.boxes: list[tuple[tuple[int, int], tuple[int, int]]] = []
-        self.slide_num = slide_num
-        self.total_slides = total
+        self.slide_num: int = slide_num
+        self.total_slides: int = total_slides
+        self._start: tuple[int, int] | None = None
         cv2.setMouseCallback(self.window_name, self._mouse_cb)
 
-    def _mouse_cb(self, event, x, y, flags, _) -> None:  # noqa: D401
+    def _mouse_cb(
+        self, event: int, x: int, y: int, flags: int, _: Any
+    ) -> None:  # noqa: D401
+        """Mouse callback to record box start/end on drag events."""
         if event == cv2.EVENT_LBUTTONDOWN:
-            self.start = (x, y)
-        elif event == cv2.EVENT_LBUTTONUP:
+            self._start = (x, y)
+        elif event == cv2.EVENT_LBUTTONUP and self._start is not None:
             end = (x, y)
-            self.boxes.append((self.start, end))
+            self.boxes.append((self._start, end))
+            self._start = None
 
-    def run(self) -> tuple[str, list[tuple]]:
+    def clear_boxes(self) -> None:
+        """Clears all drawn boxes."""
+        self.boxes.clear()
+
+    def run(
+        self,
+    ) -> tuple[str, list[tuple[tuple[int, int], tuple[int, int]]]]:  # noqa: D401
+        """Displays the slide window and returns action ('next','back','quit') plus boxes."""
         while True:
             frame = self.original.copy()
             for pt1, pt2 in self.boxes:
-                cv2.rectangle(frame, pt1, pt2, (0, 255, 0), 2)
-            title = f"Slide Viewer - ({self.slide_num} / {self.total_slides})"
+                cv2.rectangle(
+                    frame,
+                    pt1,
+                    pt2,
+                    ViewerConfig.rect_color,
+                    ViewerConfig.rect_thickness,
+                )
+            title = ViewerConfig.title_format.format(
+                name=self.window_name, current=self.slide_num, total=self.total_slides
+            )
             cv2.setWindowTitle(self.window_name, title)
             cv2.imshow(self.window_name, frame)
             key = cv2.waitKey(1)
-            if key == ord("w"):
+            if key == KeyBindings.next_slide:
                 return "next", self.boxes
-            if key == ord("q"):
+            if key == KeyBindings.prev_slide:
                 return "back", self.boxes
-            if key == 27:
+            if key == KeyBindings.quit:
                 return "quit", []
-            if key == ord("u") and self.boxes:
+            if key == KeyBindings.undo_box and len(self.boxes) > 0:
                 self.boxes.pop()
+            if key == KeyBindings.clear_boxes:
+                self.clear_boxes()
 
 
+def save_crops(
+    img: NDArray[np.uint8],
+    boxes: list[tuple[tuple[int, int], tuple[int, int]]],
+    slide_idx: int,
+    out_dir: Path,
+) -> None:
+    """Save image crops for the given slide based on annotated boxes."""
+    h, w, _ = img.shape
+    for j, (pt1, pt2) in enumerate(boxes, start=1):
+        x1, y1 = pt1
+        x2, y2 = pt2
+        x1, x2 = sorted((max(0, x1), min(w, x2)))
+        y1, y2 = sorted((max(0, y1), min(h, y2)))
+        crop = img[y1:y2, x1:x2]
+        if crop.size == 0:
+            continue
+        crop_path = out_dir.joinpath(f"slide_{slide_idx + 1:03}_crop_{j}.png")
+        cv2.imwrite(str(crop_path), crop)
+        print(f"[GUI] Saved {crop_path.name}")
 
 
 def annotate_pdf(pdf_path: Path, out_dir: Path) -> None:
-    doc = fitz.open(pdf_path)
+    """Launches GUI for annotating slides from *pdf_path* and saving crops to *out_dir*."""
+    doc = fitz.open(pdf_path)  # type: ignore[arg-type]
     n_slides = len(doc)
-    cv2.namedWindow("Slide Viewer", cv2.WINDOW_NORMAL)
-    cv2.moveWindow("Slide Viewer", 100, 100)
+    cv2.namedWindow(ViewerConfig.window_name, cv2.WINDOW_NORMAL)
+    cv2.moveWindow(ViewerConfig.window_name, *ViewerConfig.window_position)
     slide_idx = 0
 
     while 0 <= slide_idx < n_slides:
         page = doc[slide_idx]
-        pix = page.get_pixmap(dpi=200)
-        img = cv2.imdecode(
-            np.frombuffer(pix.tobytes("png"), np.uint8), cv2.IMREAD_COLOR
-        )
+        pix = cast(PixMap, page.get_pixmap(dpi=200))
+        img_data = np.frombuffer(pix.tobytes("png"), dtype=np.uint8)
+        img = cv2.imdecode(img_data, cv2.IMREAD_COLOR)
+        if img is None:
+            raise RuntimeError("Failed to decode slide image.")
+        img = np.asarray(img, dtype=np.uint8)
         drawer = BoxDrawer(img, slide_idx + 1, n_slides)
         action, boxes = drawer.run()
-
         if action == "quit":
             break
-
-        # Consolidated crop saving logic for "back" and "next"
         if boxes:
-            for j, (pt1, pt2) in enumerate(boxes, start=1):
-                x1, y1 = pt1
-                x2, y2 = pt2
-                h, w, _ = img.shape
-                x1, x2 = sorted((max(0, x1), min(w, x2)))
-                y1, y2 = sorted((max(0, y1), min(h, y2)))
-                crop = img[y1:y2, x1:x2]
-                if crop.size == 0:
-                    continue
-                crop_path = out_dir / f"slide_{slide_idx + 1:03}_crop_{j}.png"
-                cv2.imwrite(str(crop_path), crop)
-                print(f"[GUI] Saved {crop_path.name}")
-
+            save_crops(img, boxes, slide_idx, out_dir)
         if action == "back" and slide_idx > 0:
             slide_idx -= 1
         elif action == "next":
             slide_idx += 1
-
     cv2.destroyAllWindows()
 
 
-
-if __name__ == "__main__":
+def main() -> None:
+    """Launches the window and the background OCR worker after parsing the argV for filepath."""
+    print(__doc__)
     parser = argparse.ArgumentParser(
         description="Annotate LaTeX regions in a PDF deck of slides."
     )
@@ -184,22 +254,21 @@ if __name__ == "__main__":
         help="Directory to store image crops and OCR .tex files (default: ./latex_regions)",
     )
     args = parser.parse_args()
-
-    PDF_FILE = Path(args.pdf).expanduser().resolve()
-    OUT_DIR = Path(args.out).expanduser().resolve()
-
-    if not PDF_FILE.is_file():
-        raise FileNotFoundError(f"PDF file not found: {PDF_FILE}")
-
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-
+    pdf_file = Path(args.pdf).expanduser().resolve()
+    out_dir = Path(args.out).expanduser().resolve()
+    if not pdf_file.is_file():
+        raise FileNotFoundError(f"PDF file not found: {pdf_file}")
+    out_dir.mkdir(parents=True, exist_ok=True)
     stop_evt = Event()
-    worker = Process(target=ocr_worker, args=(OUT_DIR, stop_evt))
+    worker = Process(target=ocr_worker, args=(out_dir, stop_evt))
     worker.start()
-
     try:
-        annotate_pdf(PDF_FILE, OUT_DIR)
+        annotate_pdf(pdf_file, out_dir)
     finally:
         stop_evt.set()
         worker.join()
         print("All done. Bye!")
+
+
+if __name__ == "__main__":
+    main()
