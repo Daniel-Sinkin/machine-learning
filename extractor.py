@@ -44,6 +44,8 @@ import fitz
 import numpy as np
 from numpy.typing import NDArray
 
+ESCAPE_KEY = 27
+
 
 @dataclass(frozen=True)
 class ViewerConfig:
@@ -64,7 +66,7 @@ class KeyBindings:
     prev_slide: int = ord("b")
     undo_box: int = ord("u")
     clear_boxes: int = ord("c")
-    quit: int = 27  # ESC
+    quit: int = ESCAPE_KEY
 
 
 class PixMap:  # pylint: disable=too-few-public-methods
@@ -208,7 +210,7 @@ def save_crops(
 
 def annotate_pdf(pdf_path: Path, out_dir: Path) -> None:
     """Launches GUI for annotating slides from *pdf_path* and saving crops to *out_dir*."""
-    doc = fitz.open(pdf_path)  # type: ignore[arg-type]
+    doc = fitz.open(pdf_path)
     n_slides = len(doc)
     cv2.namedWindow(ViewerConfig.window_name, cv2.WINDOW_NORMAL)
     cv2.moveWindow(ViewerConfig.window_name, *ViewerConfig.window_position)
